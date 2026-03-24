@@ -214,8 +214,8 @@ class RewardNet(nn.Module):
 
     def set_mean_std(self, pairs, device = 'cuda:0'):
         '''
-        computes the mean and std over provided pairs data, 
-        and sets the mean and std properties 
+        computes the mean and std over provided pairs data,
+        and sets the mean and std properties
         '''
         self.eval()
         rewards = []
@@ -227,6 +227,60 @@ class RewardNet(nn.Module):
         self.mean, self.std = np.mean(unnorm_rewards), np.std(unnorm_rewards)
 
 
+class RewardEnsemble:
+    """Ensemble of reward predictors as described in the paper (Section 2.2.3).
+
+    Each predictor is trained on |D| samples drawn with replacement from D.
+    The estimate r_hat is defined by independently normalizing each predictor
+    and then averaging the results.
+    """
+
+    def __init__(self, n_members=3, l2=0.01, dropout=0.2, env_type='procgen'):
+        self.n_members = n_members
+        self.members = [RewardNet(l2=l2, dropout=dropout, env_type=env_type) for _ in range(n_members)]
+
+    def __call__(self, x):
+        """Average predictions across independently-normalized ensemble members."""
+        preds = [member(x) for member in self.members]
+        return np.mean(preds, axis=0)
+
+    def to(self, device):
+        for member in self.members:
+            member.to(device)
+        return self
+
+    def train(self):
+        for member in self.members:
+            member.train()
+
+    def eval(self):
+        for member in self.members:
+            member.eval()
+
+    def parameters(self):
+        """Yield all parameters from all members (for saving/loading)."""
+        for member in self.members:
+            yield from member.parameters()
+
+    def save(self, path):
+        torch.save([m.model for m in self.members], path)
+
+    def set_mean_std(self, pairs, device='cuda:0'):
+        for member in self.members:
+            member.set_mean_std(pairs, device)
+
+    @property
+    def l2(self):
+        return self.members[0].l2
+
+    @l2.setter
+    def l2(self, value):
+        for member in self.members:
+            member.l2 = value
+
+    def predict_returns_per_member(self, clip):
+        """Return per-member predicted returns for a clip (used for disagreement-based query selection)."""
+        return [member(clip) for member in self.members]
 
 
 def rm_loss_func(ret0, ret1, label, device = 'cuda:0'):
@@ -266,42 +320,32 @@ def calc_val_loss(reward_model, data_buffer, device):
 
 
 @timeitt
-def train_reward(reward_model, optimizer, adaptive, data_buffer, num_samples, batch_size, device = 'cuda:0'):
-
+def train_reward_single(reward_model, optimizer, adaptive, data_buffer, num_samples, batch_size, device = 'cuda:0'):
     '''
-    Traines a given reward_model for num_batches from data_buffer
-    Returns the new reward_model
-    
-    Must have:
-        Adaptive L2-regularization based on train vs validation loss
-        L2-loss on the output
-        Output normalized to 0 mean and 0.05 variance across data_buffer
-        (Ibarz et al. page 15)
-        
+    Trains a single reward model for num_batches from data_buffer using bootstrap sampling
+    (sampling with replacement from the training data).
     '''
     num_batches = int(num_samples / batch_size)
     reward_model.to(device)
     reward_model.train()
-    # current weight decay is stored as the reward_model property
-    # and is being adjusted throughout the training
     weight_decay = reward_model.l2
     av_loss = 0
     val_loss = calc_val_loss(reward_model, data_buffer, device)
     losses = []
 
-    
     print(f'Vall loss: {val_loss:6.4f}, Vall loss LB : {data_buffer.val_loss_lb:6.4f},')
     for batch_i in range(1, num_batches + 1):
-        annotations = data_buffer.sample_batch(batch_size)
+        # Bootstrap sampling: sample with replacement from the training data
+        annotations = [random.choice(data_buffer.train_data) for _ in range(batch_size)]
         loss = 0
         optimizer.zero_grad()
-        
+
         for clip0, clip1 , label in annotations:
-            
+
             ret0 = reward_model(clip0)
             ret1 = reward_model(clip1)
             loss += rm_loss_func(ret0, ret1, label, device)
-        
+
         loss = loss / batch_size
         losses.append(loss.item())
 
@@ -309,32 +353,51 @@ def train_reward(reward_model, optimizer, adaptive, data_buffer, num_samples, ba
         optimizer.step()
 
         if batch_i % 100 == 0:
-            
+
             av_loss = np.mean(losses[-100:])
-            # Adaptive L2 regularization based on the 
-            # difference between training and validation losses
             if adaptive:
-                
+
                 if val_loss > 1.5 * (av_loss):
-                    for g in optimizer.param_groups: 
+                    for g in optimizer.param_groups:
                         g['weight_decay'] = g['weight_decay'] * 1.1
                         weight_decay = g['weight_decay']
                 elif val_loss < av_loss * 1.1:
                      for g in optimizer.param_groups:
-                        g['weight_decay'] = g['weight_decay'] / 1.1   
+                        g['weight_decay'] = g['weight_decay'] / 1.1
                         weight_decay = g['weight_decay']
-                val_loss = calc_val_loss(reward_model, data_buffer, device) 
+                val_loss = calc_val_loss(reward_model, data_buffer, device)
             else:
                 pass
 
             print(f'batch : {batch_i}, loss : {av_loss:6.4f}, val loss: {val_loss:6.4f},  L2 : {weight_decay:8.6f}')
-            
-        
-    # Storing the weight decay to be used at the next iteration of reward model training
-    reward_model.l2 = weight_decay  
-    # Adjusting mean and std of the for new version of the reward model 
-    reward_model.set_mean_std(data_buffer.get_all_pairs())
+
+    reward_model.l2 = weight_decay
     return reward_model, optimizer, (av_loss, val_loss, weight_decay)
+
+
+@timeitt
+def train_reward(ensemble, optimizers, adaptive, data_buffer, num_samples, batch_size, device = 'cuda:0'):
+    '''
+    Trains the reward model ensemble. Each member is trained on |D| samples
+    drawn with replacement from D (bootstrap sampling), as described in the paper
+    (Section 2.2.3).
+    '''
+    all_stats = []
+    for i, (member, opt) in enumerate(zip(ensemble.members, optimizers)):
+        print(f'\n--- Training ensemble member {i+1}/{ensemble.n_members} ---')
+        member, opt, stats = train_reward_single(member, opt, adaptive, data_buffer, num_samples, batch_size, device)
+        all_stats.append(stats)
+
+    # Average stats across ensemble members for logging
+    avg_train_loss = np.mean([s[0] for s in all_stats])
+    avg_val_loss = np.mean([s[1] for s in all_stats])
+    avg_l2 = np.mean([s[2] for s in all_stats])
+
+    # Independently normalize each member then set ensemble-level l2
+    ensemble.set_mean_std(data_buffer.get_all_pairs())
+    ensemble.l2 = avg_l2
+
+    return ensemble, optimizers, (avg_train_loss, avg_val_loss, avg_l2)
 
 
     
@@ -357,23 +420,27 @@ def train_policy(policy, num_steps, rl_steps, log_name, callback):
    
 
 @timeitt
-def collect_annotations(venv, policy, num_pairs, clip_size, to_cuda = True):
+def collect_annotations(venv, policy, num_pairs, clip_size, ensemble, to_cuda = True, device = 'cuda:0'):
     '''
     Collects episodes using the provided policy, slices them to snippets of given length,
-    selects pairs randomly and adds a label based on which snipped had larger reward
-    Returns a list of lists [clip0, clip1, label], where label is float in [0,1]
+    selects pairs using ensemble disagreement (Section 2.2.4) and adds a label based on
+    which snippet had larger reward.
+
+    Per the paper: we draw 10x more clip pair candidates than needed, use each reward
+    predictor to predict which segment is preferred, then select pairs with highest
+    variance across ensemble members.
     '''
 
     n_envs = venv.num_envs
 
     clip_pool = []
     obs_stack = []
-    # we take a noop step in the environment,instead of doing reset(), becase AtariWrapper
+    # we take a noop step in the environment, instead of doing reset(), because AtariWrapper
     # raises error if you happen to call reset one step before dying
 
     obs_b, *_ = venv.step(n_envs*[0])
 
-    #collecting 10x as many observations as needed for randomization
+    # Collect 10x as many clips as needed for disagreement-based selection
     while len(clip_pool) < 10 * num_pairs * 2:
         clip_returns = n_envs * [0]
         for _ in range(clip_size):
@@ -381,7 +448,7 @@ def collect_annotations(venv, policy, num_pairs, clip_size, to_cuda = True):
             action_b , _states = policy.predict(obs_b)
             obs_stack.append(obs_b)
 
-            obs_b, r_b, dones, infos = venv.step(action_b)    
+            obs_b, r_b, dones, infos = venv.step(action_b)
             clip_returns += r_b
 
         obs_stack = np.array(obs_stack)
@@ -389,14 +456,40 @@ def collect_annotations(venv, policy, num_pairs, clip_size, to_cuda = True):
 
         obs_stack = []
 
-    clip_pairs = np.random.choice(clip_pool, (num_pairs, 2), replace = False)
+    # Generate 10x candidate pairs
+    n_candidates = min(10 * num_pairs, len(clip_pool) // 2)
+    candidate_pairs = np.random.choice(clip_pool, (n_candidates, 2), replace = False)
+
+    # Select pairs with highest ensemble disagreement (Section 2.2.4):
+    # For each pair, each ensemble member predicts which segment is preferred,
+    # then select pairs with highest variance across members.
+    ensemble.eval()
+    pair_variances = []
+    for clip0, clip1 in candidate_pairs:
+        obs0 = torch.tensor(clip0['observations'], device=device, dtype=torch.uint8)
+        obs1 = torch.tensor(clip1['observations'], device=device, dtype=torch.uint8)
+
+        # Get per-member predicted returns
+        member_prefs = []
+        for member in ensemble.members:
+            ret0 = member(obs0)
+            ret1 = member(obs1)
+            # Preference as probability that clip0 is preferred
+            member_prefs.append((ret0 - ret1))
+
+        pair_variances.append(np.var(member_prefs))
+
+    # Select top num_pairs by variance
+    top_indices = np.argsort(pair_variances)[-num_pairs:]
+    selected_pairs = candidate_pairs[top_indices]
+
     data = []
-    for clip0, clip1 in clip_pairs:
+    for clip0, clip1 in selected_pairs:
 
         if clip0['sum_rews'] > clip1['sum_rews']:
             label = 0.0
         elif clip0['sum_rews'] < clip1['sum_rews']:
-            label = 1.0 
+            label = 1.0
         elif clip0['sum_rews'] == clip1['sum_rews']:
             label = 0.5
 
@@ -478,15 +571,15 @@ def main():
         store_args(args, run_dir)
         policy = A2C('CnnPolicy', venv_fn(), verbose=1, tensorboard_log="TB_LOGS", ent_coef=0.01, learning_rate = 0.0007,
             policy_kwargs={"optimizer_class" : torch.optim.Adam, "optimizer_kwargs" : {"eps" : 1e-5, "betas" : [.99,.999]}})
-        reward_model = RewardNet(l2= args.l2, dropout = args.dropout, env_type = args.env_type)        
+        reward_model = RewardEnsemble(n_members=3, l2=args.l2, dropout=args.dropout, env_type=args.env_type)
         data_buffer = AnnotationBuffer()
-        
-    # initializing RM optimizer
-    rm_optimizer = optim.Adam(reward_model.parameters(), lr= 0.0003, weight_decay = reward_model.l2)
+
+    # initializing per-member RM optimizers
+    rm_optimizers = [optim.Adam(member.parameters(), lr=0.0003, weight_decay=reward_model.l2) for member in reward_model.members]
     
-    #creating the environment with reward replaced by the prediction from reward_model
+    #creating the environment with reward replaced by the ensemble-averaged prediction
     reward_model.to(device)
-    proxy_reward_function = lambda x: reward_model(torch.from_numpy(x).float().to(device))
+    proxy_reward_function = lambda x: reward_model(x)
     proxy_reward_venv = Vec_reward_wrapper(venv_fn(), proxy_reward_function)
 
     # resetting the environment to avoid raising error from reset_num_timesteps
@@ -504,12 +597,12 @@ def main():
         t_start = time.time()
         print(f'================== Initial iter ====================')
 
-        annotations = collect_annotations(annotation_env, policy, args.init_buffer_size, args.clip_size, args.on_cuda)
-        data_buffer.add(annotations)   
+        annotations = collect_annotations(annotation_env, policy, args.init_buffer_size, args.clip_size, reward_model, args.on_cuda, device)
+        data_buffer.add(annotations)
 
         print(f'Buffer size = {data_buffer.current_size}')
-        
-        reward_model, rm_optimizer, rm_train_stats = train_reward(reward_model, rm_optimizer, args.adaptive, data_buffer, args.init_train_size, args.pairs_in_batch)
+
+        reward_model, rm_optimizers, rm_train_stats = train_reward(reward_model, rm_optimizers, args.adaptive, data_buffer, args.init_train_size, args.pairs_in_batch)
         # this callback adds values to TensorBoard logs for easier plotting
         reward_model.eval()
         callback = TensorboardCallback((data_buffer.total_labels, data_buffer.loss_lb, iter_time, rm_train_stats))
@@ -542,12 +635,12 @@ def main():
         # decaying the number of pairs to collect
         num_pairs = round(init_num_pairs / (rl_steps/(args.total_timesteps/10) + 1))
 
-        annotations = collect_annotations(annotation_env, policy, num_pairs, args.clip_size, args.on_cuda)
-        data_buffer.add(annotations)   
+        annotations = collect_annotations(annotation_env, policy, num_pairs, args.clip_size, reward_model, args.on_cuda, device)
+        data_buffer.add(annotations)
 
         print(f'Buffer size = {data_buffer.current_size}')
-        
-        reward_model, rm_optimizer, rm_train_stats = train_reward(reward_model, rm_optimizer, args.adaptive, data_buffer, args.pairs_per_iter, args.pairs_in_batch)
+
+        reward_model, rm_optimizers, rm_train_stats = train_reward(reward_model, rm_optimizers, args.adaptive, data_buffer, args.pairs_per_iter, args.pairs_in_batch)
 
         #TODO : pretify passing data to callback
         callback = TensorboardCallback((data_buffer.total_labels, data_buffer.loss_lb, iter_time, rm_train_stats))
